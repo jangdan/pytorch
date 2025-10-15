@@ -50,7 +50,7 @@ op_bench.generate_pt_test(all_long_configs + all_short_configs, AllBenchmark)
 
 
 class AnyBenchmark(op_bench.TorchBenchmarkBase):
-    def init(self, M, N, device, dtype):
+    def init(self, M, N, device):
         self.inputs = {
             "input_one": torch.randint(0, 2, (M, N), device=device, dtype=torch.bool)
         }
