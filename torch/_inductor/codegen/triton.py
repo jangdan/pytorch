@@ -1357,7 +1357,7 @@ class TritonOverrides(OpOverrides):
                 value = triton_reshape(value, initial_shape, shape_2d)
 
                 # broadcast if needed
-                broadcast_needed = not (shape_2d == [YBLOCK, RBLOCK])
+                broadcast_needed = shape_2d != [YBLOCK, RBLOCK]
                 if broadcast_needed:
                     value = f"tl.broadcast_to({value}, ({YBLOCK}, {RBLOCK}))"
 
@@ -1379,7 +1379,7 @@ class TritonOverrides(OpOverrides):
                 value = f"tl.trans({value})"
 
                 # broadcast if needed
-                broadcast_needed = not (shape_2d == [XBLOCK, RBLOCK])
+                broadcast_needed = shape_2d != [XBLOCK, RBLOCK]
                 if broadcast_needed:
                     value = f"tl.broadcast_to({value}, ({RBLOCK}, {XBLOCK}))"
             else:
