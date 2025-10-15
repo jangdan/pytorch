@@ -27,10 +27,7 @@ all_short_configs = op_bench.config_list(
 
 class AllBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, M, N, K, device):
-        self.inputs = {
-            "input_one": torch.rand(
-                M, N, K, device=device).bool()
-        }
+        self.inputs = {"input_one": torch.rand(M, N, K, device=device).bool()}
         self.set_module_name("all")
 
     def forward(self, input_one):
@@ -52,10 +49,7 @@ op_bench.generate_pt_test(all_long_configs + all_short_configs, AllBenchmark)
 
 class AnyBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, M, N, device, dtype):
-        self.inputs = {
-            "input_one": torch.rand(
-                (M, N), device=device).bool()
-        }
+        self.inputs = {"input_one": torch.rand((M, N), device=device).bool()}
         self.set_module_name("any")
 
     def forward(self, input_one):
