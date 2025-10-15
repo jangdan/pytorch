@@ -28,7 +28,7 @@ all_short_configs = op_bench.config_list(
 class AllBenchmark(op_bench.TorchBenchmarkBase):
     def init(self, M, N, K, device):
         self.inputs = {
-            "input_one": torch.randint(0, 2, (M, N, K), device=device, dtype=torch.bool
+            "input_one": torch.randint(0, 2, (M, N, K), device=device, dtype=torch.bool)
         }
         self.set_module_name("all")
 
