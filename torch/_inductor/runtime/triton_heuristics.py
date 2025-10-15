@@ -3189,6 +3189,10 @@ def persistent_reduction(
     inductor_meta.pop(persistent_reduction_key)
 
     configs = filter_reduction_configs_for_determinism(inductor_meta, configs)
+
+    if inductor_meta.get("RSPLIT_SIZE"):
+        for c in configs:
+            c.kwargs["RSPLIT_SIZE"] = inductor_meta.get("RSPLIT_SIZE")
     return cached_autotune(
         size_hints,
         configs,
@@ -3484,6 +3488,10 @@ class Grid2DWithYZOverflow(GridExpr):
         self.y_grid = self.ceildiv("y_grid_raw_", "y_grid_div_")
         self.z_grid = "y_grid_div_"
 
+class MixOrderReductionGrid(GridExpr):
+    def generate(self, meta: dict[str, int]) -> None:
+        assert self.inductor_meta.get("RSPLIT_SIZE") % meta.get("XBLOCK") == 0  # TODO will remove
+        self.x_grid = self.ceildiv("xnumel", self.inductor_meta.get("RSPLIT_SIZE"))
 
 class CooperativeReductionGrid(GridExpr):
     def generate(self, meta: dict[str, int]) -> None:

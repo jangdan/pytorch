@@ -1988,6 +1988,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         self._load_counts: collections.Counter[str] = collections.Counter()
         self._load_index = 0
 
+        self.saved_partial_accumulate = {}
+
         # A set of autotuning hints to pass as part of triton_meta
         self.autotune_hints = OrderedSet[AutotuneHint]()
         self.triton_meta: Optional[dict[str, Any]] = None
@@ -2711,6 +2713,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 f"0; {GDC_LAUNCH} # gdc launch for {result_var}",
             )
             self.cse.generate(launch_buffer, launch_if_last_load, dtype=torch.int32)
+
+
+    def partial_accumulate(self, name: str, val):
+        self.saved_partial_accumulate[name] = val
 
     def load(self, name: str, index: sympy.Expr):
         """
@@ -4038,7 +4044,53 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             return
 
         loop_trees = [tree for tree in self.range_trees if tree.is_loop]
-        if self.inside_reduction and len(loop_trees) > 0:
+        if self.mix_order_reduction:
+            # self.body.writeline("if True:")
+            self.body.writeline(
+                f"accum = tl.full([R0_BLOCK], 0.0, tl.float32)[None, :]"
+            )
+            if len(self.saved_partial_accumulate) == 2:
+                self.body.writeline(
+                    f"accum2 = tl.full([R0_BLOCK], 0.0, tl.float32)[None, :]"
+                )
+            self.body.writeline(
+                f"for suboff in range(0, RSPLIT_SIZE, XBLOCK):"
+            )
+            with self.body.indent(offset=1):
+                # TODO don't hard code this
+                self.body.writelines([
+                    "x0 = xindex + suboff",
+                ])
+                self.body.splice(self.indexing_code)
+                self.body.splice(self.loads)
+                self.body.splice(self.compute)
+                self.body.splice(self.stores)
+                self.body.splice(self.post_loop_store)
+
+                assert len(self.saved_partial_accumulate) in [1, 2]
+                var = list(self.saved_partial_accumulate.values())[0]
+                # TODO: find the tmp0 name from cache
+                # TODO: no need to sum if XBLOCK == 0
+                self.body.writeline(
+                    f"accum += {var}.sum(axis=0)",
+                )
+                if len(self.saved_partial_accumulate) == 2:
+                    var2 = list(self.saved_partial_accumulate.values())[1]
+                    self.body.writeline(
+                        f"accum2 += {var2}.sum(axis=0)",
+                    )
+            # buf2 is the intermediate buffer
+            # var = self.args.output("buf2")
+            # self.store("buf2", None, "accum")
+            self.body.writeline(
+                "tl.store(ws_ptr + tl.program_id(0) * r0_numel + r0_index, accum, r0_mask)"
+            )
+            if len(self.saved_partial_accumulate) == 2:
+                self.body.writeline(
+                    "tl.store(ws_ptr + (tl.program_id(0) + tl.num_programs(0)) * r0_numel + r0_index, accum2, r0_mask)"
+                )
+
+        elif self.inside_reduction and len(loop_trees) > 0:
             # Write the loop headers.
             for level, tree in enumerate(loop_trees):
                 with self.body.indent(offset=level):
@@ -4109,7 +4161,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 strip=True,
             )
             self.cooperative_reduction_workspace_cache.on_loop_end()
-        self.body.splice(self.post_loop_store)
+        if not self.mix_order_reduction:
+            self.body.splice(self.post_loop_store)
         self.indexing_code.clear()
         self.loads.clear()
         self.compute.clear()
@@ -4337,6 +4390,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         metadata, and benchmarking infra.
         """
 
+        if self.mix_order_reduction:
+            self.args.workspace(self.numels["r0_"] * ((self.numels["x"] + self.rsplit_size - 1) // self.rsplit_size), False, dtype=torch.float)
+
+            # TODO add multiple workspace only if needed
+            self.args.workspace(self.numels["r0_"] * ((self.numels["x"] + self.rsplit_size - 1) // self.rsplit_size), False, dtype=torch.float)
+
         code = IndentedBuffer()
 
         size_hints = {}
@@ -4451,6 +4510,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
         if self.cooperative_reduction:
             add_constexpr_arg("RSPLIT")
 
+        if self.mix_order_reduction:
+            add_constexpr_arg("RSPLIT_SIZE")
+
         triton_meta_signature = signature_to_meta(
             signature, size_dtype=self.index_dtype, argdefs=argdefs
         )
@@ -4478,6 +4540,9 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             "num_reduction": self.num_reduction,
             **self.inductor_meta_common(),
         }
+
+        if self.mix_order_reduction:
+            inductor_meta["RSPLIT_SIZE"] = self.rsplit_size
 
         if config.deterministic or config.test_configs.force_filter_reduction_configs:
             inductor_meta["has_loadstore_with_contiguous_rdim"] = (
@@ -4705,7 +4770,10 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
 
     def _get_grid_type(self) -> type[triton_heuristics.GridExpr]:
         n = sum([int(not tree.is_reduction) for tree in self.range_trees])
-        if self.cooperative_reduction:
+        if self.mix_order_reduction:
+            assert n == 1
+            return triton_heuristics.MixOrderReductionGrid
+        elif self.cooperative_reduction:
             assert n == 1
             return triton_heuristics.CooperativeReductionGrid
         elif n == 1:
@@ -4730,7 +4798,12 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 call_args.append(expr)
                 arg_types.append(type(expr))
 
-    def call_kernel(self, name: str, node: Optional[IRNode] = None):
+    def deallocate_workspaces(self):
+        wrapper = V.graph.wrapper_code
+        for ws in reversed(self.args.workspace_args):
+            wrapper.generate_workspace_deallocation(ws)
+
+    def call_kernel(self, name: str, node: Optional[IRNode] = None, deallocate_ws=True):
         wrapper = V.graph.wrapper_code
         wrapper.write_triton_header_once()
         _, call_args, _, arg_types = self.args.python_argdefs()
@@ -4747,8 +4820,8 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
             triton_meta=self.triton_meta,
         )
 
-        for ws in reversed(self.args.workspace_args):
-            wrapper.generate_workspace_deallocation(ws)
+        if deallocate_ws:
+            self.deallocate_workspaces()
 
     def codegen_nan_check(self) -> None:
         wrapper = V.graph.wrapper_code
@@ -4964,9 +5037,11 @@ class TritonKernel(SIMDKernel[TritonCSEVariable]):
                 line = f"{x}offset + {self.iteration_ranges_ranges_code(entry)}"
             else:
                 line = self.iteration_ranges_scalar_code(entry, f"{x}offset")
+
+            block_size = f"{x.upper()}BLOCK" if not self.mix_order_reduction else "RSPLIT_SIZE"
             code.writelines(
                 [
-                    f"{x}offset = {self.iteration_ranges_get_pid(entry)} * {x.upper()}BLOCK",
+                    f"{x}offset = {self.iteration_ranges_get_pid(entry)} * {block_size}",
                     f"{entry.name} = {line}",
                 ]
             )

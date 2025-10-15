@@ -33,6 +33,7 @@ from torch.utils._sympy.symbol import (
 
 from ..._dynamo.utils import counters
 from .. import config, ir, scheduler
+from ..scheduler import MixOrderReduction
 from ..analyze_preserves_zero_mask import prologue_preserves_zero_mask
 from ..codecache import code_hash
 from ..dependencies import MemoryDep, StarDep, WeakDep
@@ -384,6 +385,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
         override_persistent_reduction: Optional[bool] = None,
         override_cooperative_reduction: Optional[bool] = None,
         tiling_scores: Optional[dict[str, sympy.Expr]] = None,
+        mix_order_reduction: bool = False,
     ) -> None:
         if pid_cache is None:
             pid_cache = {}
@@ -411,6 +413,7 @@ class SIMDKernel(Kernel[CSEVariableType], Generic[CSEVariableType]):
             if override_persistent_reduction is not None
             else self.should_use_persistent_reduction()
         )
+        self.mix_order_reduction: bool = mix_order_reduction
         self.no_x_dim = self.want_no_x_dim()
         self.code_hash: Optional[str] = None
         # Info to enable multiple store_output calls for epilogue subtiling
@@ -1189,6 +1192,10 @@ class SIMDScheduling(BaseScheduling):
         if node1.is_reduction() and node2.is_reduction():
             reduction_can_fuse = numel1 == numel2 and rnumel1 == rnumel2
             if not reduction_can_fuse:
+                from torch._inductor.scheduler import MixOrderReduction
+                reduction_can_fuse = MixOrderReduction.can_fuse(node1, node2)
+
+            if not reduction_can_fuse:
                 why(
                     "numel/rnumel mismatch (reduce) (%s, %s), (%s, %s)",
                     numel1,
@@ -1391,6 +1398,84 @@ class SIMDScheduling(BaseScheduling):
                 )
 
         return node_schedule
+
+    def codegen_mix_order_reduction(self, node):
+        # snodes = node.snodes
+        # assert len(snodes) == 2
+        # assert isinstance(snodes[0], scheduler.SchedulerNode)
+        # assert isinstance(snodes[1], scheduler.SchedulerNode)
+
+        node1, node2 = node.node1, node.node2
+
+        # Make sure there are no producer/consumer relationship
+        assert not (node1.ancestors & node2.get_operation_names()) and not (
+            node2.ancestors & node1.get_operation_names()
+        )
+
+        self._codegen_mix_order_reduction(node1, node2)
+
+    def _codegen_mix_order_reduction(self, node1, node2):
+        if not V.graph.sizevars.statically_known_gt(node1.group[1][0], node1.group[1][1]):
+            return self._codegen_mix_order_reduction(node2, node1)
+
+        assert V.graph.sizevars.statically_known_gt(node1.group[1][0], node1.group[1][1])
+
+        # decide the split size
+        nrow, ncol = node1.group[1]
+        split_size = 128 # TODO don't hard code
+        nsplit = (nrow + split_size - 1) // split_size
+
+        # TODO: create the intermediate tensor
+        if True:
+            numel, rnumel = node1.group[1]
+
+            # if isinstance(node2, scheduler.FusedSchedulerNode): breakpoint() # TODO
+            node2 = node2.extract_pw_from_reduction()
+            node2.swap_pw_red_dimension()
+            node_schedule = self.generate_node_schedule(node1.get_nodes() + node2.get_nodes(), numel, rnumel)
+            kernel_features = SIMDKernelFeatures(node_schedule, numel, rnumel, None)
+            kernel = self.create_kernel_choices(kernel_features,
+                [{"x": numel, "r0_": rnumel}], {"features": kernel_features, "tiling_scores": None, "mix_order_reduction": True})[0]
+            # breakpoint()
+            # TODO: instead of create the kernel and then change the attributes, let the kernel constructor decides these attributes itself.
+            assert kernel.persistent_reduction
+            assert kernel.mix_order_reduction
+            kernel.rsplit_size = split_size
+
+            self.codegen_node_schedule_with_kernel(node_schedule, kernel) 
+            with V.set_kernel_handler(kernel):
+                src_code = kernel.codegen_kernel()
+            kernel_name = self.define_kernel(src_code, node_schedule, kernel)
+            kernel.kernel_name = kernel_name
+            kernel.code_hash = code_hash(src_code)
+
+            with V.set_kernel_handler(kernel):
+                for node in kernel_features.scheduler_nodes():
+                    node.mark_run()
+                for node in node2.get_nodes():
+                    node.mark_run()
+
+            # workspace args is still needed after the call
+            kernel.call_kernel(kernel.kernel_name, deallocate_ws=False)
+            V.graph.removed_buffers |= kernel.removed_buffers
+            V.graph.inplaced_to_remove |= kernel.inplaced_to_remove
+
+            # a extra sum
+            assert len(node2.get_buffer_names()) in [1, 2]
+            bufname = tuple(node2.get_buffer_names())[0]
+            V.graph.wrapper_code.writeline(
+                f"{bufname} = workspace_0[:{nsplit} * 768].view({nsplit}, 768).sum(dim=0)",
+            )
+            if len(node2.get_buffer_names()) == 2:
+                bufname2 = tuple(node2.get_buffer_names())[1]
+                V.graph.wrapper_code.writeline(
+                    f"{bufname2} = workspace_0[{nsplit} * 768:].view({nsplit}, 768).sum(dim=0)",
+                )
+            kernel.deallocate_workspaces()
+            self.free_buffers_in_scheduler()
+        else:
+            self.codegen_node(node1)
+        # breakpoint(); self.codegen_node(node2)
 
     def codegen_node(
         self, node: Union[scheduler.FusedSchedulerNode, scheduler.SchedulerNode]
