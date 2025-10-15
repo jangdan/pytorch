@@ -14,9 +14,6 @@ binary_ops_bcast_list = op_bench.op_list(
         ["sub", torch.sub],
         ["div", torch.div],
         ["mul", torch.mul],
-        ["asr", torch.bitwise_right_shift],
-        ["lsl", torch.bitwise_left_shift],
-        ["xor", torch.bitwise_xor],
     ],
 )
 
