@@ -363,6 +363,7 @@ class TestPublicBindings(TestCase):
             "torch._inductor.codegen.cpp_micro_gemm",
             "torch._inductor.codegen.cpp_template_kernel",
             "torch._inductor.runtime.triton_helpers",
+            "torch._inductor.template_heuristics.cutedsl",
             "torch.ao.pruning._experimental.data_sparsifier.lightning.callbacks.data_sparsity",
             "torch.backends._coreml.preprocess",
             "torch.contrib._tensorboard_vis",
