@@ -279,12 +279,35 @@ def post_grad_passes(gm: torch.fx.GraphModule, is_inference: bool):
     GraphTransformObserver(gm, "reinplace_inplaceable_ops").apply_graph_pass(
         functools.partial(reinplace_inplaceable_ops, fake_tensor_updater),
     )
+
     GraphTransformObserver(
         gm, "decompose_triton_kernel_wrapper_functional"
     ).apply_graph_pass(decompose_triton_kernel_wrapper_functional)
-    GraphTransformObserver(gm, "decompose_auto_functionalized").apply_graph_pass(
-        decompose_auto_functionalized
-    )
+
+    if post_grad_mutable_custom_post_pass := config.post_grad_mutable_custom_post_pass:
+        from torch._inductor.pattern_matcher import (
+            add_implict_edges,
+            remove_implict_edges,
+        )
+
+        # Always decompose and add edges, even if no existing mutable ops are present.
+        # user's custom pass may introduce new mutable ops
+        decompose_auto_functionalized(gm.graph)
+        add_implict_edges(gm)
+        gm.graph.lint()
+
+        GraphTransformObserver(
+            gm, "post_grad_mutable_custom_post_pass"
+        ).apply_graph_pass(post_grad_mutable_custom_post_pass)
+
+        remove_implict_edges(gm.graph)
+        gm.graph.eliminate_dead_code()
+
+    else:
+        GraphTransformObserver(gm, "decompose_auto_functionalized").apply_graph_pass(
+            decompose_auto_functionalized
+        )
+
     if not torch._dynamo.config.skip_fsdp_hooks:
         GraphTransformObserver(gm, "reinplace_fsdp_all_gather").apply_graph_pass(
             comms.reinplace_fsdp_all_gather
@@ -1254,6 +1277,7 @@ def decompose_auto_functionalized(graph):
     tells us (via rewriting the arguments or .meta to those nodes) which
     Tensors we should clone and which Tensors are safe to reinplace.
     """
+
     graph_pass = PatternMatcherPass()
 
     @register_graph_pattern(
@@ -1380,6 +1404,28 @@ def decompose_auto_functionalized(graph):
         op="call_function", target=torch.ops.higher_order.auto_functionalized_v2
     ):
         raise AssertionError("auto_functionalized_v2 was not removed")
+
+
+def make_autofunctionalize(gm: torch.fx.GraphModule):
+    from torch._subclasses.functional_tensor import (
+        dispatch_functionalize,
+        FunctionalTensorMode,
+    )
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    fake_inputs = []
+    for node in gm.graph.nodes:
+        if node.op == "placeholder":
+            fake_val = node.meta.get("val")
+            if fake_val is not None:
+                fake_inputs.append(fake_val)
+
+    def wrapper(*inputs):
+        return gm(*inputs)
+
+    mode = FunctionalTensorMode()
+    functionalized_fn = dispatch_functionalize(wrapper, mode)
+    return make_fx(functionalized_fn, tracing_mode="fake")(*fake_inputs)
 
 
 @register_lowering_pattern(
